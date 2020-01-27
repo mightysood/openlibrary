@@ -43,19 +43,14 @@ SUBJECTS = [
 DEFAULT_RESULTS = 12
 MAX_RESULTS = 1000
 
-class subjects_index(delegate.page):
-    path = "/subjects"
-
-    def GET(self):
-        delegate.context.setdefault('bodyid', 'subject')
-        page = render_template("subjects/index.html")
-        page.v2 = True
-        return page
-
 class subjects(delegate.page):
     path = '(/subjects/[^/]+)'
 
     def GET(self, key):
+        from openlibrary.plugins.worksearch.code import search
+        s = key.split('/')[2]
+        return search().GET(subject=s)
+
         nkey = self.normalize_key(key)
         if nkey != key:
             raise web.redirect(nkey)

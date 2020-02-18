@@ -61,7 +61,14 @@ $def with (page)
 
   <ul class="navigation-component">
     <li class="browse-menu">
-      <a href="/subjects">$_('Browse')</a>
+      <a>$_('Browse') <img class="down-arrow"
+        width="7" height="4" aria-hidden="true" alt="$_('Browse')" role="presentation" src="/static/images/down-arrow.png"/></a>
+      <div class="navigation-dropdown-component">
+        <ul class="dropdown-menu browse-menu-options">
+          <li><a href="/subjects">$_("Subjects")</a></li>
+          <li><a href="/lists">$_("Lists")</a></li>
+        </ul>
+      </div>
     </li>
     <li class="my-books-menu">
       <a>$_('My Books') <img class="down-arrow"

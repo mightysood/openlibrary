@@ -266,7 +266,7 @@ class search(delegate.page):
             q = {'type': '/type/author', 'name~': i.prefix + '*', 'sort': 'name', 'limit': 5}
             things = web.ctx.site.things(q)
             things = [web.ctx.site.get(key) for key in things]
-            result = [dict(type=[{'id': t.key, 'name': t.key}], name=web.utf8(t.name), guid=t.key, id=t.key, article=dict(id=t.key)) for t in things]
+            result = [dict(type=[{'id': t.key, 'name': t.key}], name=web.safestr(t.name), guid=t.key, id=t.key, article=dict(id=t.key)) for t in things]
         else:
             result = []
         callback = i.pop('callback', None)
@@ -293,7 +293,7 @@ class blurb(delegate.page):
 
         body += '<br/>'
         if author.bio:
-            body += web.utf8(author.bio)
+            body += web.safestr(author.bio)
 
         result = dict(body=body, media_type='text/html', text_encoding='utf-8')
         d = dict(status='200 OK', code='/api/status/ok', result=result)
@@ -859,15 +859,13 @@ def setup_context_defaults():
 
 
 def setup():
-    from openlibrary.plugins.openlibrary import (home, inlibrary, borrow_home, libraries,
-                                                 stats, support, events, design, status,
+    from openlibrary.plugins.openlibrary import (home, borrow_home, stats,
+                                                 support, events, design, status,
                                                  merge_editions, authors)
 
     home.setup()
     design.setup()
-    inlibrary.setup()
     borrow_home.setup()
-    libraries.setup()
     stats.setup()
     support.setup()
     events.setup()

@@ -1,8 +1,15 @@
 import re
 import simplejson
 import requests
+import time
+from dateutil import parser as isoparser
 from decimal import Decimal
-from amazon.api import SearchException
+
+from paapi5_python_sdk.api.default_api import DefaultApi
+from paapi5_python_sdk.get_items_request import GetItemsRequest
+from paapi5_python_sdk.get_items_resource import GetItemsResource
+from paapi5_python_sdk.partner_type import PartnerType
+
 from infogami.utils.view import public
 from openlibrary.core import lending, cache, helpers as h
 from openlibrary.utils import dateutil
@@ -11,14 +18,193 @@ from openlibrary.utils.isbn import (
 from openlibrary.catalog.add_book import load
 from openlibrary import accounts
 
+amazon_api = None
+config_amz_api = None
+
 BETTERWORLDBOOKS_BASE_URL = 'https://betterworldbooks.com'
-BETTERWORLDBOOKS_API_URL = 'https://products.betterworldbooks.com/service.aspx?ItemId='
+BETTERWORLDBOOKS_API_URL = ('https://products.betterworldbooks.com/service.aspx?'
+                            'IncludeAmazon=True&ItemId=')
 BWB_AFFILIATE_LINK = 'http://www.anrdoezrs.net/links/{}/type/dlg/http://www.betterworldbooks.com/-id-%s'.format(h.affiliate_id('betterworldbooks'))
 AMAZON_FULL_DATE_RE = re.compile(r'\d{4}-\d\d-\d\d')
 ISBD_UNIT_PUNCT = ' : '  # ISBD cataloging title-unit separator punctuation
 
+
+def setup(config):
+    global config_amz_api, amazon_api
+    config_amz_api = config.get('amazon_api')
+    try:
+        amazon_api = AmazonAPI(
+            config_amz_api.key, config_amz_api.secret,
+            config_amz_api.id, throttling=0.9)
+    except AttributeError:
+        amazon_api = None
+
+
+class AmazonAPI:
+    """Amazon Product Advertising API 5.0 wrapper for Python"""
+    RESOURCES = {
+        'all': [
+            getattr(GetItemsResource, v) for v in
+            # Hack: pulls all resource consts from GetItemsResource
+            vars(GetItemsResource).keys() if v.isupper()
+        ],
+        'import': [
+            GetItemsResource.IMAGES_PRIMARY_LARGE,
+            GetItemsResource.ITEMINFO_BYLINEINFO,
+            GetItemsResource.ITEMINFO_CONTENTINFO,
+            GetItemsResource.ITEMINFO_MANUFACTUREINFO,
+            GetItemsResource.ITEMINFO_PRODUCTINFO,
+            GetItemsResource.ITEMINFO_TITLE,
+            GetItemsResource.ITEMINFO_CLASSIFICATIONS,
+            GetItemsResource.OFFERS_LISTINGS_PRICE,
+        ],
+        'prices': [
+            GetItemsResource.OFFERS_LISTINGS_PRICE
+        ]
+    }
+
+
+    def __init__(self, key, secret, tag, host='webservices.amazon.com',
+                 region='us-east-1', throttling=0.9):
+        """
+        Creates an instance containing your API credentials.
+
+        :param key (string): affiliate key
+        :param secret (string): affiliate secret
+        :param tag (string): affiliate string
+        :param host (string): which server to query
+        :param region (string): which regional host to query
+        :param throttling (float): Reduce this value to wait longer
+          between API calls.
+        :return: Amazon metadata for one product
+        :rtype: dict
+        """
+        self.tag = tag
+        self.throttling = throttling
+        self.last_query_time = time.time()
+
+        self.api = DefaultApi(
+            access_key=key,
+            secret_key=secret,
+            host=host,
+            region=region)
+
+    def get_product(self, asin, serialize=False, **kwargs):
+        products = self.get_products([asin], **kwargs)
+        if products:
+            return next(self.serialize(p) if serialize else p for p in products)
+
+    def get_products(self, asins, serialize=False, marketplace='www.amazon.com',
+                     resources=None, **kwargs):
+        """
+        :param asins (string): One or more ItemIds like ASIN that
+        uniquely identify an item or product URL. (Max 10) Seperated
+        by comma or as a list.
+        """
+        item_ids = asins if type(asins) is list else [asins]
+
+        # Wait before doing the request
+        wait_time = 1 / self.throttling - (time.time() - self.last_query_time)
+        if wait_time > 0:
+            time.sleep(wait_time)
+        self.last_query_time = time.time()
+
+        try:
+            _resources = (self.RESOURCES[resources] if resources
+                          else self.RESOURCES['import'])
+            request = GetItemsRequest(partner_tag=self.tag,
+                                      partner_type=PartnerType.ASSOCIATES,
+                                      marketplace=marketplace,
+                                      item_ids=item_ids,
+                                      resources=_resources,
+                                      **kwargs)
+            response = self.api.get_items(request)
+            products = response.items_result.items
+            return (products if not serialize else
+                    [self.serialize(p) for p in products])
+        except Exception as exception:
+            raise exception
+
+    @staticmethod
+    def serialize(product):
+        """Takes a full Amazon product Advertising API returned AmazonProduct
+        with multiple ResponseGroups, and extracts the data we are
+        interested in.
+
+        :param AmazonAPI product:
+        :return: Amazon metadata for one product
+        :rtype: dict
+
+        {
+          'price': '$54.06',
+          'price_amt': 5406,
+          'physical_format': 'hardcover',
+          'authors': [{'name': 'Guterson, David'}],
+          'publish_date': 'Jan 21, 2020',
+          #'dimensions': {
+          #  'width': [1.7, 'Inches'],
+          #  'length': [8.5, 'Inches'],
+          #  'weight': [5.4, 'Pounds'],
+          #  'height': [10.875, 'Inches']
+          # },
+          'publishers': ['Victory Belt Publishing'],
+          'source_records': ['amazon:1628603976'],
+          'title': 'Boundless: Upgrade Your Brain, Optimize Your Body & Defy Aging',
+          'url': 'https://www.amazon.com/dp/1628603976/?tag=internetarchi-20',
+          'number_of_pages': 640,
+          'cover': 'https://m.media-amazon.com/images/I/51IT9MV3KqL._AC_.jpg',
+          'languages': ['English']
+          'edition_num': '1'
+        }
+
+        """
+        if not product:
+            return {}  # no match?
+
+        item_info = getattr(product, 'item_info')
+        images = getattr(product, 'images')
+        edition_info = item_info and getattr(item_info, 'content_info')
+        attribution = item_info and getattr(item_info, 'by_line_info')
+        price = (getattr(product, 'offers') and product.offers.listings
+                 and product.offers.listings[0].price)
+
+        try:
+            publish_date = edition_info and isoparser.parse(
+                edition_info.publication_date.display_value
+            ).strftime('%b %d, %Y')
+        except Exception:
+            publish_date = None
+
+        book = {
+            'url': "https://www.amazon.com/dp/%s/?tag=%s" % (
+                product.asin, h.affiliate_id('amazon')),
+            'source_records': ['amazon:%s' % product.asin],
+            'isbn_10': [product.asin],
+            'isbn_13': [isbn_10_to_isbn_13(product.asin)],
+            'price': price and price.display_amount,
+            'price_amt': price and price.amount and int(100 * price.amount),
+            'title': item_info and item_info.title and item_info.title.display_value,
+            'cover': (images and images.primary and images.primary.large and
+                      images.primary.large.url),
+            'authors': attribution and [{'name': contrib.name}
+                        for contrib in attribution.contributors],
+            'publishers': (attribution and attribution.brand and
+                           [attribution.brand.display_value]),
+            'number_of_pages': (edition_info and edition_info.pages_count and
+                                edition_info.pages_count.display_value),
+            'edition_num': (edition_info and edition_info.edition and
+                            edition_info.edition.display_value),
+            'publish_date': publish_date,
+            'physical_format': (
+                item_info and item_info.classifications and
+                getattr(item_info.classifications.binding, 'display_value', '').lower()
+            ),
+        }
+        return book
+
+
 @public
-def get_amazon_metadata(id_, id_type='isbn'):
+def get_amazon_metadata(id_, id_type='isbn', resources=None):
     """Main interface to Amazon LookupItem API. Will cache results.
 
     :param str id_: The item id: isbn (10/13), or Amazon ASIN.
@@ -26,8 +212,7 @@ def get_amazon_metadata(id_, id_type='isbn'):
     :return: A single book item's metadata, or None.
     :rtype: dict or None
     """
-
-    return cached_get_amazon_metadata(id_, id_type=id_type)
+    return cached_get_amazon_metadata(id_, id_type=id_type, resources=resources)
 
 
 def search_amazon(title='', author=''):
@@ -35,102 +220,17 @@ def search_amazon(title='', author=''):
     books by author and/or title.
     https://docs.aws.amazon.com/AWSECommerceService/latest/DG/ItemSearch.html
 
+    XXX! Broken while migrating from paapi 4.0 to 5.0
+
     :param str title: title of book to search for.
     :param str author: author name of book to search for.
     :return: dict of "results", a list of one or more found books, with metadata.
     :rtype: dict
     """
-
-    results = lending.amazon_api.search(Title=title, Author=author, SearchIndex='Books')
-    data = {'results': []}
-    try:
-        for product in results:
-            data['results'].append(_serialize_amazon_product(product))
-    except SearchException:
-        data = {'error': 'no results'}
-    return data
+    pass
 
 
-def _serialize_amazon_product(product):
-    """Takes a full Amazon product Advertising API returned AmazonProduct
-    with multiple ResponseGroups, and extracts the data we are interested in.
-
-    :param amazon.api.AmazonProduct product:
-    :return: Amazon metadata for one product
-    :rtype: dict
-    """
-
-    price_fmt = price = qlt = None
-    used = product._safe_get_element_text('OfferSummary.LowestUsedPrice.Amount')
-    new = product._safe_get_element_text('OfferSummary.LowestNewPrice.Amount')
-
-    # prioritize lower prices and newer, all things being equal
-    if used and new:
-        price, qlt = (used, 'used') if int(used) < int(new) else (new, 'new')
-    # accept whichever is available
-    elif used or new:
-        price, qlt = (used, 'used') if used else (new, 'new')
-
-    if price:
-        price = '{:00,.2f}'.format(int(price)/100.)
-        if qlt:
-            price_fmt = "$%s (%s)" % (price, qlt)
-
-    data = {
-        'url': "https://www.amazon.com/dp/%s/?tag=%s" % (
-            product.asin, h.affiliate_id('amazon')),
-        'price': price_fmt,
-        'price_amt': price,
-        'qlt': qlt,
-        'title': product.title,
-        'authors': [{'name': name} for name in product.authors],
-        'source_records': ['amazon:%s' % product.asin],
-        'number_of_pages': product.pages,
-        'languages': list(product.languages),
-        'cover': product.large_image_url,
-        'product_group': product.product_group,
-    }
-    if product._safe_get_element('OfferSummary') is not None:
-        data['offer_summary'] = {
-            'total_new': int(product._safe_get_element_text('OfferSummary.TotalNew')),
-            'total_used': int(product._safe_get_element_text('OfferSummary.TotalUsed')),
-            'total_collectible': int(product._safe_get_element_text('OfferSummary.TotalCollectible')),
-        }
-        collectible = product._safe_get_element_text('OfferSummary.LowestCollectiblePrice.Amount')
-        if new:
-            data['offer_summary']['lowest_new'] = int(new)
-        if used:
-            data['offer_summary']['lowest_used'] = int(used)
-        if collectible:
-            data['offer_summary']['lowest_collectible'] = int(collectible)
-        amazon_offers = product._safe_get_element_text('Offers.TotalOffers')
-        if amazon_offers:
-            data['offer_summary']['amazon_offers'] = int(amazon_offers)
-
-    if product.publication_date:
-        data['publish_date'] = product._safe_get_element_text('ItemAttributes.PublicationDate')
-        if re.match(AMAZON_FULL_DATE_RE, data['publish_date']):
-            data['publish_date'] = product.publication_date.strftime('%b %d, %Y')
-
-    if product.binding:
-        data['physical_format'] = product.binding.lower()
-    if product.edition:
-        data['edition'] = product.edition
-    if product.publisher:
-        data['publishers'] = [product.publisher]
-    if product.isbn:
-        isbn = product.isbn
-        if len(isbn) == 10:
-            data['isbn_10'] = [isbn]
-            data['isbn_13'] = [isbn_10_to_isbn_13(isbn)]
-        elif len(isbn) == 13:
-            data['isbn_13'] = [isbn]
-            if isbn.startswith('978'):
-                data['isbn_10'] = [isbn_13_to_isbn_10(isbn)]
-    return data
-
-
-def _get_amazon_metadata(id_, id_type='isbn'):
+def _get_amazon_metadata(id_, id_type='isbn', resources=None):
     """Uses the Amazon Product Advertising API ItemLookup operation to locatate a
     specific book by identifier; either 'isbn' or 'asin'.
     https://docs.aws.amazon.com/AWSECommerceService/latest/DG/ItemLookup.html
@@ -140,24 +240,16 @@ def _get_amazon_metadata(id_, id_type='isbn'):
     :return: A single book item's metadata, or None.
     :rtype: dict or None
     """
-
-    kwargs = {}
     if id_type == 'isbn':
         id_ = normalize_isbn(id_)
-        kwargs = {'SearchIndex': 'Books', 'IdType': 'ISBN'}
-    kwargs['ItemId'] = id_
-    kwargs['MerchantId'] = 'Amazon'  # Only affects Offers Response Group, does Amazon sell this directly?
+        if len(id_) == 13 and id_.startswith('978'):
+            id_ = isbn_13_to_isbn_10(id_)
 
-    if not lending.amazon_api:
-        raise Exception("Open Library is not configured to access Amazon's API")
-    try:
-        product = lending.amazon_api.lookup(**kwargs)
-    except Exception:
-        return None
-    # when more than 1 product returned, choose first
-    if isinstance(product, list):
-        product = product[0]
-    return _serialize_amazon_product(product)
+    if amazon_api:
+        try:
+            return amazon_api.get_product(id_, serialize=True, resources=resources)
+        except Exception:
+            return None
 
 
 def split_amazon_title(full_title):
@@ -315,7 +407,8 @@ def _get_betterworldbooks_metadata(isbn):
     new_price = re.findall(r"<LowestNewPrice>\$([0-9.]+)</LowestNewPrice>", response)
     used_price = re.findall(r"<LowestUsedPrice>\$([0-9.]+)</LowestUsedPrice>", response)
     used_qty = re.findall("<TotalUsed>([0-9]+)</TotalUsed>", response)
-
+    market_price = re.findall(r"<LowestMarketPrice>\$([0-9.]+)</LowestMarketPrice>",
+                              response)
     price = qlt = None
 
     if used_qty and used_qty[0] and used_qty[0] != '0':
@@ -328,21 +421,24 @@ def _get_betterworldbooks_metadata(isbn):
             price = _price
             qlt = 'new'
 
-    return betterworldbooks_fmt(isbn, qlt, price)
+    market_price = market_price and '$' + market_price[0]
+
+    return betterworldbooks_fmt(isbn, qlt, price, market_price)
 
 
-def betterworldbooks_fmt(isbn, qlt=None, price=None):
+def betterworldbooks_fmt(isbn, qlt=None, price=None, market_price=None):
     """Defines a standard interface for returning bwb price info
 
     :param str isbn:
     :param str qlt: Quality of the book, e.g. "new", "used"
     :param str price: Price of the book as a decimal str, e.g. "4.28"
-    :rtype: dict 
+    :rtype: dict
     """
     price_fmt = "$%s (%s)" % (price, qlt) if price and qlt else None
     return {
         'url': BWB_AFFILIATE_LINK % isbn,
         'isbn': isbn,
+        'market_price': market_price,
         'price': price_fmt,
         'price_amt': price,
         'qlt': qlt
